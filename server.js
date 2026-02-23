@@ -3,6 +3,75 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
+// ============================================================
+// 🔐 OAUTH INSTALLATION FLOW (Required for Store B)
+// ============================================================
+ 
+import crypto from "crypto";
+import querystring from "querystring";
+ 
+const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
+ 
+// Step 1 — Start OAuth
+app.get("/auth", (req, res) => {
+  const shop = req.query.shop;
+ 
+  if (!shop) return res.status(400).send("Missing shop parameter");
+ 
+  const state = crypto.randomBytes(16).toString("hex");
+  const redirectUri = `${process.env.APP_URL}/auth/callback`;
+ 
+  const installUrl =
+    `https://${shop}/admin/oauth/authorize?` +
+    querystring.stringify({
+      client_id: SHOPIFY_API_KEY,
+      scope: "write_orders,read_orders,write_products,read_products",
+      redirect_uri: redirectUri,
+      state,
+    });
+ 
+  res.redirect(installUrl);
+});
+ 
+// Step 2 — OAuth Callback (Shopify sends token here)
+app.get("/auth/callback", async (req, res) => {
+  const { shop, code } = req.query;
+ 
+  if (!shop || !code) {
+    return res.status(400).send("Missing required parameters");
+  }
+ 
+  const tokenUrl = `https://${shop}/admin/oauth/access_token`;
+ 
+  const tokenResp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: SHOPIFY_API_KEY,
+      client_secret: SHOPIFY_API_SECRET,
+      code,
+    }),
+  });
+ 
+  const tokenData = await tokenResp.json();
+ 
+  if (!tokenData.access_token) {
+    console.error("❌ Failed to get access token:", tokenData);
+    return res.status(500).send("OAuth failed");
+  }
+ 
+  console.log("✅ Received Admin API token for", shop);
+ 
+  // You can store this however you want — for now, log instructions
+  console.log("👉 Add this to Render ENV:");
+  console.log("SHOPIFY_ACCESS_TOKEN=", tokenData.access_token);
+  console.log("SHOP=", shop);
+ 
+  res.send("App installed! Check your Render logs for the token.");
+});
+
+
 const PORT = process.env.PORT || 3000;
 const SHOP = process.env.SHOP;
 const ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
