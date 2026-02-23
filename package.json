@@ -1,0 +1,16 @@
+{
+  "name": "truckload-splitter",
+  "version": "1.0.0",
+  "description": "Shopify order splitter with project name and pickup date metafields",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+"engines": {
+  "node": ">=18 <21"
+  }
+}
