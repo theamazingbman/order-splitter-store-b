@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const SHOP = process.env.SHOP;
-const API_VERSION = process.env.API_VERSION || "2023-10";
+const API_VERSION = process.env.API_VERSION || "2026-04";
 // ============================================================
 // 🧠 Local In-Memory Lock (Prevents Race Conditions)
 // ============================================================
