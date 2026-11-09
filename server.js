@@ -16,6 +16,73 @@ if (!SHOP) {
 }
 
 const shopBaseUrl = `https://${SHOP}`;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Check HTTP errors; only repeat POST requests after an explicit rate limit.
+async function checkedShopifyFetch(url, options = {}, retries = 5) {
+  const method = options.method || "GET";
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const token = await getShopifyToken();
+    if (!token) throw new Error("Shopify access token is missing");
+    const resp = await fetch(url, {
+      ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}), "X-Shopify-Access-Token": token },
+    });
+    const text = await resp.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = null; }
+    if (resp.ok) {
+      if (!data || typeof data !== "object") throw new Error(`Invalid JSON from Shopify: ${url}`);
+      return data;
+    }
+    console.error("❌ Shopify API request failed:", { url, status: resp.status, response: data || text });
+    const err = new Error(`Shopify request failed (${resp.status}): ${url}`);
+    err.status = resp.status;
+    const retryable = resp.status === 429 || (["GET", "PUT"].includes(method) && [500, 502, 503, 504].includes(resp.status));
+    if (!retryable || attempt === retries) throw err;
+    const header = resp.headers.get("retry-after");
+    const seconds = header === null ? NaN : Number(header);
+    await sleep(Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000 * (attempt + 1));
+  }
+}
+
+async function readOrderMetafield(orderId, key) {
+  const query = new URLSearchParams({ namespace: "custom", key, limit: "250" });
+  const data = await checkedShopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields.json?${query}`);
+  if (!Array.isArray(data.metafields)) throw new Error(`Invalid metafield response for order ${orderId}`);
+  return data.metafields.find(m => m.namespace === "custom" && m.key === key) || null;
+}
+
+// Repair only this metafield, then verify it. Never creates a child order.
+async function saveVerifiedMetafield(orderId, key, type, value) {
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const existing = await readOrderMetafield(orderId, key);
+      if (existing?.value !== value || existing?.type !== type) {
+        const url = existing?.id
+          ? `${shopBaseUrl}/admin/api/${API_VERSION}/metafields/${existing.id}.json`
+          : `${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields.json`;
+        const metafield = existing?.id ? { id: existing.id, type, value } : { namespace: "custom", key, type, value };
+        await checkedShopifyFetch(url, { method: existing?.id ? "PUT" : "POST", body: JSON.stringify({ metafield }) });
+      }
+      const saved = await readOrderMetafield(orderId, key);
+      if (saved?.value !== value || saved?.type !== type) throw new Error(`Readback mismatch for order ${orderId}, custom.${key}: expected ${value}, got ${saved?.value ?? "missing"}`);
+      console.log(`✅ Verified custom.${key} for order ${orderId}: ${value} (attempt ${attempt})`);
+      return;
+    } catch (err) {
+      lastError = err;
+      console.error(`❌ Verification failed for order ${orderId}, custom.${key}, attempt ${attempt}/3: ${err.message}`);
+      if ([400, 401, 403, 422].includes(err.status)) break;
+      if (attempt < 3) await sleep(1000 * attempt);
+    }
+  }
+  throw lastError;
+}
+
 // Normalize dates
 function normalizeDate(input) {
   if (!input || typeof input !== "string") return null;
@@ -67,52 +134,20 @@ async function getParentOrder(orderId) {
 // 🔒 Metafield Lock Helpers (custom.processing_lock)
 // ============================================================
 async function getProcessingLock(orderId) {
-  try {
-    const resp = await fetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${orderId}/metafields.json`, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": await getShopifyToken(),
-      },
-    });
-    const data = await resp.json();
-    const lockField = Array.isArray(data?.metafields)
-      ? data.metafields.find(m => m.namespace === "custom" && m.key === "processing_lock")
-      : null;
-    return lockField?.value || null;
-  } catch (err) {
-    console.error("❌ Error fetching processing lock:", err);
-    return null;
-  }
+  return (await readOrderMetafield(orderId, "processing_lock"))?.value || null;
 }
 async function setProcessingLock(orderId, value) {
-  try {
-    await fetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": await getShopifyToken(),
-      },
-      body: JSON.stringify({
-        metafield: {
-          namespace: "custom",
-          key: "processing_lock",
-          type: "single_line_text_field",
-          value,
-          owner_id: orderId,
-          owner_resource: "order",
-        },
-      }),
-    });
-    console.log(`🔒 Lock for order ${orderId} set to: ${value}`);
-  } catch (err) {
-    console.error("❌ Error setting processing lock:", err);
-  }
+  await saveVerifiedMetafield(orderId, "processing_lock", "single_line_text_field", value);
+  console.log(`🔒 Lock for order ${orderId} set to: ${value}`);
 }
 async function assertLockAvailable(orderId) {
   const lock = await getProcessingLock(orderId);
   if (lock === "in_progress") {
     console.log(`⛔ Split already in progress for ${orderId}. Skipping.`);
+    return false;
+  }
+  if (lock === "failed") {
+    console.log(`⛔ Parent ${orderId} previously failed. Manual review required; not recreating children.`);
     return false;
   }
   if (lock === "done") {
@@ -146,6 +181,7 @@ app.post("/webhook/orders/create", async (req, res) => {
      : typeof order.tags === "string"
        ? order.tags.split(",").map(t => t.trim())
        : [];
+   let processingStarted = false;
    try {
      console.log(`🔔 Webhook fired for order ${order.id}`);
 
@@ -172,20 +208,19 @@ if (lockState === "in_progress" && !tagsArray.some(t => t.startsWith("Parent-#")
       console.log(`⛔ Lock prevents processing for ${order.id}. Exiting early.`);
       return res.status(200).send("Split skipped due to lock");
     }
-    // 2. Set lock to in_progress BEFORE any splitting logic
-    await setProcessingLock(order.id, "in_progress");
-    console.log(`🔒 Lock set to in_progress for parent ${order.id}`);
     // 🚫 Skip child orders immediately
     if ((order.tags || "").includes("Split-Child")) {
       console.log("↩️ Child order detected. Skipping split.");
       return res.status(200).send("Child order skipped");
     }
-    // ✅ Double‑check parent order tags from Shopify before splitting
+    // ✅ Double-check parent order tags from Shopify before splitting
     const latestParent = await getParentOrder(order.id);
     if ((latestParent.tags || "").includes("Split-Processed") || (latestParent.tags || "").includes("Truckload-Ready")) {
       console.log("↩️ Parent already marked as processed. Skipping split.");
       return res.status(200).send("Already processed");
     }
+    processingStarted = true;
+    await setProcessingLock(order.id, "in_progress");
     // 🏷️ Tag parent immediately to prevent duplicate splits
     const newTags = order.tags ? `${order.tags}, Split-Processed` : "Split-Processed";
     await fetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders/${order.id}.json`, {
@@ -272,28 +307,28 @@ if (lockState === "in_progress" && !tagsArray.some(t => t.startsWith("Parent-#")
 const projectName = Array.isArray(item.properties)
   ? item.properties.find(p => p.name === "Project Name")?.value || null
   : null;
- 
+
 const pickupDateRaw = Array.isArray(item.properties)
   ? item.properties.find(p => p.name === "Pickup Date")?.value || null
   : null;
- 
+
 const pickupDateNormalized = normalizeDate(pickupDateRaw);
- 
-// 🔹 Extract per‑item warehouse instructions from line item property "Customer Note"
+
+// 🔹 Extract per-item warehouse instructions from line item property "Customer Note"
 const warehouseInstructionsRaw = Array.isArray(item.properties)
   ? item.properties.find(p => p.name === "Customer Note")?.value || null
   : null;
- 
+
 const warehouseInstructions = warehouseInstructionsRaw?.trim() || null;
- 
+
 // Build child note
 let childNoteParts = [];
 if (pickupDateNormalized) childNoteParts.push(`Pickup Date: ${pickupDateNormalized}`);
 if (warehouseInstructions) childNoteParts.push(`Warehouse Instructions: ${warehouseInstructions}`);
- 
+
 const childNote = childNoteParts.join(" | ");
 console.log(`🔎 Child order ${i + 1} — Note: ${childNote}`);
- 
+
 
         const newOrderPayload = {
           order: {
@@ -320,16 +355,11 @@ console.log(`🔎 Child order ${i + 1} — Note: ${childNote}`);
           },
         };
         console.log("🧾 Creating child order payload:", JSON.stringify(newOrderPayload, null, 2));
-        const createResp = await fetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders.json`, {
+        const createdOrder = await checkedShopifyFetch(`${shopBaseUrl}/admin/api/${API_VERSION}/orders.json`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": await getShopifyToken(),
-          },
           body: JSON.stringify(newOrderPayload),
         });
-        const createdOrder = await createResp.json();
-        if (!createResp.ok || !createdOrder.order?.id) continue;
+        if (!createdOrder.order?.id) throw new Error(`Child creation returned no ID for parent ${order.id}; review before retrying`);
         console.log(`✅ Created child order ${createdOrder.order.id} with tags: ${createdOrder.order.tags}`);
         childOrdersCreated = true;
         // Attach project name metafield
@@ -355,24 +385,11 @@ console.log(`🔎 Child order ${i + 1} — Note: ${childNote}`);
         // Attach pickup date metafield
         const effectivePickupDate = pickupDateNormalized || parentPickupDate;
         if (effectivePickupDate) {
-          await fetch(`${shopBaseUrl}/admin/api/${API_VERSION}/metafields.json`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Shopify-Access-Token": await getShopifyToken(),
-            },
-            body: JSON.stringify({
-              metafield: {
-                namespace: "custom",
-                key: "pickup_date",
-                type: "date",
-                value: effectivePickupDate,
-                owner_id: createdOrder.order.id,
-                owner_resource: "order",
-              },
-            }),
-          });
+          await saveVerifiedMetafield(createdOrder.order.id, "pickup_date", "date", effectivePickupDate);
+        } else {
+          console.warn(`⚠️ Child ${createdOrder.order.id}: no pickup date in line item or parent`);
         }
+        await sleep(500);
       }
     }
         // ============================================================
@@ -427,10 +444,8 @@ console.log(`🔎 Child order ${i + 1} — Note: ${childNote}`);
       });
     }
     // ============================================================
-    // 🔒 FINAL LOCK COMPLETION — ALWAYS mark as done
+    // 🔒 FINAL LOCK COMPLETION — after child date verification
     // ============================================================
-    console.log(`🔒 Split logic completed — marking lock as done for ${order.id}`);
-    await setProcessingLock(order.id, "done");
     // ============================================================
     // 🏷️ Final parent tagging logic
     // ============================================================
@@ -446,9 +461,15 @@ console.log(`🔎 Child order ${i + 1} — Note: ${childNote}`);
       });
       console.log(`🏷️ Parent ${order.name} tagged as Truckload-Ready (no child orders created)`);
     }
+    await setProcessingLock(order.id, "done");
+    console.log(`🔒 Split completed with expected child dates verified for ${order.id}`);
     res.status(200).send("Split processed");
   } catch (err) {
     console.error("❌ Error processing split:", err);
+    if (processingStarted) {
+      try { await setProcessingLock(order.id, "failed"); }
+      catch (lockError) { console.error(`❌ Could not save failed lock for parent ${order.id}; manual review required:`, lockError); }
+    }
     res.status(500).send("Error");
   } finally {
     // ============================================================
